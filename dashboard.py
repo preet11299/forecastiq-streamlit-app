@@ -376,6 +376,31 @@ def _sample_xlsx_bytes() -> bytes:
     buf=io.BytesIO(); wb.save(buf); return buf.getvalue()
 
 
+def _starter_kit_zip() -> bytes:
+    """Zip containing the Excel guide + a sample CSV."""
+    import zipfile, io as _io
+    xlsx_bytes = _sample_xlsx_bytes()
+    rng = np.random.default_rng(7)
+    dates = pd.date_range("2023-01-02", periods=104, freq="W")
+    cats = ["Electronics","Apparel","Home & Garden","Sporting Goods","Automotive"]
+    locs = ["Store_A","Store_B","Store_C","Warehouse_1","Warehouse_2"]
+    rows = []
+    for i in range(10):
+        sku = f"SKU-{i+1:03d}"
+        base, trend = 80+i*20, 0.5+i*0.2
+        for t, d in enumerate(dates):
+            s = (10+i*3)*np.sin(2*np.pi*t/52)
+            qty = max(base+trend*t+s+rng.normal(0,6+i), 0)
+            rows.append([d.strftime("%Y-%m-%d"), sku, round(qty,0), cats[i%5], locs[i%5]])
+    csv_bytes = pd.DataFrame(rows, columns=["Date","SKU","Quantity","Category","Location"]
+                             ).to_csv(index=False).encode()
+    buf = _io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("forecastiq_guide.xlsx", xlsx_bytes)
+        zf.writestr("forecastiq_sample.csv",  csv_bytes)
+    return buf.getvalue()
+
+
 def _run_key(skus, horizon, industry, location) -> str:
     return f"{sorted(skus)}|{horizon}|{industry}|{location}"
 
@@ -622,15 +647,18 @@ with st.sidebar:
 
     # ── Step 1: Data ──────────────────────────────────────────────
     st.markdown(f'<p style="font-size:10px;color:{TEXT3};text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px;">① Data</p>', unsafe_allow_html=True)
-    uploaded_file = st.file_uploader("Upload CSV", type=["csv"], label_visibility="collapsed")
 
     st.download_button(
-        "↓ Get started (.xlsx)",
-        data=_sample_xlsx_bytes(),
-        file_name="forecastiq_template.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "↓ Get started (.zip)",
+        data=_starter_kit_zip(),
+        file_name="forecastiq_starter_kit.zip",
+        mime="application/zip",
         use_container_width=True,
+        help="Includes the format guide (.xlsx) and a sample dataset for reference.",
     )
+
+    st.markdown('<div style="margin-top:8px;"></div>', unsafe_allow_html=True)
+    uploaded_file = st.file_uploader("Upload CSV", type=["csv"], label_visibility="collapsed")
 
     use_sample = st.checkbox("Use built-in sample data", value=False)
 
@@ -781,24 +809,25 @@ with st.sidebar:
     st.markdown(f'<p style="font-size:10px;color:{TEXT4};text-align:center;margin-top:8px;">Your data never leaves your browser. Anonymous usage stats logged.</p>', unsafe_allow_html=True)
 
 
-# ── Sidebar reopen toggle ─────────────────────────────────────────────────────
-if "sidebar_open" not in st.session_state:
-    st.session_state.sidebar_open = True
-
-# Inject a persistent hamburger button when sidebar is collapsed
+# ── Mobile CSS ────────────────────────────────────────────────────────────────
 st.markdown(f"""
 <style>
-[data-testid="collapsedControl"] {{
-    display: flex !important;
-    visibility: visible !important;
-    opacity: 1 !important;
-    background: {BG2} !important;
-    border: 0.5px solid {BORDER} !important;
-    border-radius: 6px !important;
-    width: 32px !important;
-    height: 32px !important;
-    align-items: center !important;
-    justify-content: center !important;
+@media (max-width: 768px) {{
+    [data-testid="stSidebar"] {{
+        width: 85vw !important;
+        min-width: unset !important;
+    }}
+    .block-container {{
+        padding-left: 0.75rem !important;
+        padding-right: 0.75rem !important;
+        padding-top: 1rem !important;
+    }}
+    [data-testid="stMetric"] {{
+        padding: 8px 10px !important;
+    }}
+    [data-testid="stMetric"] [data-testid="stMetricValue"] {{
+        font-size: 0.95rem !important;
+    }}
 }}
 </style>
 """, unsafe_allow_html=True)
