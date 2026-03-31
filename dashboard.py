@@ -38,12 +38,21 @@ warnings.filterwarnings("ignore")
 # ── Analytics ─────────────────────────────────────────────────────────────────
 _ANALYTICS_URL = "https://script.google.com/macros/s/AKfycbx_1HTCDP_GuzqScLcM9au-CsOhioWn5xOoWCKwwX0n0dv5jcSm6IFMJx3SgdLJgY_NQQ/exec"
 
+def _get_session_id() -> str:
+    """Generate a random 8-char ID once per browser session."""
+    if "session_id" not in st.session_state:
+        import uuid
+        st.session_state.session_id = str(uuid.uuid4())[:8]
+    return st.session_state.session_id
+
 def _log_run(skus_count: int, horizon: int, industry: str, granularity: str, sku_mode: str) -> None:
     """Fire-and-forget usage log. Contains zero user data — counts and settings only."""
     import threading, urllib.request, json as _json
-    from datetime import datetime, timezone
+    from datetime import datetime, timezone, timedelta
+    PST = timezone(timedelta(hours=-8))
     payload = _json.dumps({
-        "timestamp":   datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "timestamp":   datetime.now(PST).strftime("%Y-%m-%d %H:%M:%S PST"),
+        "session_id":  _get_session_id(),
         "skus_count":  skus_count,
         "horizon":     horizon,
         "industry":    industry,
@@ -376,10 +385,144 @@ def _sample_xlsx_bytes() -> bytes:
     buf=io.BytesIO(); wb.save(buf); return buf.getvalue()
 
 
+@st.cache_data(show_spinner=False)
 def _starter_kit_zip() -> bytes:
-    """Zip containing the Excel guide + a sample CSV."""
+    """Zip: forecastiq_guide.docx + forecastiq_sample.csv"""
     import zipfile, io as _io
-    xlsx_bytes = _sample_xlsx_bytes()
+    from docx import Document as _Doc
+    from docx.shared import Pt, RGBColor, Inches
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+
+    def _add_shading(cell, fill_hex):
+        tc = cell._tc
+        tcPr = tc.get_or_add_tcPr()
+        shd = OxmlElement('w:shd')
+        shd.set(qn('w:fill'), fill_hex)
+        shd.set(qn('w:val'), 'clear')
+        tcPr.append(shd)
+
+    doc = _Doc()
+    style = doc.styles['Normal']
+    style.font.name = 'Arial'
+    style.font.size = Pt(11)
+
+    # Title
+    t = doc.add_paragraph()
+    t.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    r = t.add_run('ForecastIQ — Quick Start Guide')
+    r.bold = True; r.font.size = Pt(20); r.font.color.rgb = RGBColor(0x1F,0x38,0x64)
+
+    doc.add_paragraph('Upload your demand data and get an S&OP-ready forecast in under a minute.\nLive tool: preetpatel-forecastiq.streamlit.app — your data never leaves your browser.')
+
+    # Helper: section heading
+    def sec(txt):
+        p = doc.add_paragraph()
+        r2 = p.add_run(txt); r2.bold = True
+        r2.font.size = Pt(13); r2.font.color.rgb = RGBColor(0x25,0x63,0xEB)
+        doc.add_paragraph()
+
+    # 1 - Required columns
+    sec('1  Required columns')
+    tbl1 = doc.add_table(rows=1, cols=4)
+    tbl1.style = 'Table Grid'
+    for i, h in enumerate(['Column','Data type','Example','Accepted names']):
+        c = tbl1.rows[0].cells[i]
+        c.text = h
+        c.paragraphs[0].runs[0].bold = True
+        c.paragraphs[0].runs[0].font.color.rgb = RGBColor(0xFF,0xFF,0xFF)
+        _add_shading(c, '1F3864')
+    for row_data in [
+        ['Date',     'Date or text', '2024-01-07',  'date, week, order_date, period'],
+        ['SKU',      'Text',         'SKU-001',      'sku, item, product, product_code'],
+        ['Quantity', 'Number',       '120 or 34.5',  'quantity, qty, sales, demand, units'],
+    ]:
+        row = tbl1.add_row()
+        for i, val in enumerate(row_data):
+            row.cells[i].text = val
+            if i == 0:
+                row.cells[i].paragraphs[0].runs[0].bold = True
+
+    doc.add_paragraph()
+    sec('2  Optional columns')
+    tbl2 = doc.add_table(rows=1, cols=3)
+    tbl2.style = 'Table Grid'
+    for i, h in enumerate(['Column','Example','What it unlocks']):
+        c = tbl2.rows[0].cells[i]
+        c.text = h
+        c.paragraphs[0].runs[0].bold = True
+        c.paragraphs[0].runs[0].font.color.rgb = RGBColor(0xFF,0xFF,0xFF)
+        _add_shading(c, '1F3864')
+    for row_data in [
+        ['Category', 'Electronics', 'Category filter in sidebar'],
+        ['Location', 'Store_A',     'Location filter in sidebar'],
+        ['Price',    '9.99',        'Revenue-based Pareto ranking'],
+    ]:
+        row = tbl2.add_row()
+        for i, val in enumerate(row_data):
+            row.cells[i].text = val
+            if i == 0:
+                row.cells[i].paragraphs[0].runs[0].bold = True
+
+    doc.add_paragraph()
+    p = doc.add_paragraph()
+    r3 = p.add_run('Column order does not matter — detection is by name, not position.')
+    r3.italic = True; r3.font.color.rgb = RGBColor(0x37,0x41,0x51)
+
+    doc.add_paragraph()
+    sec('3  Data requirements')
+    reqs = [
+        ('File format',         'CSV only (.csv). Comma-delimited. UTF-8 encoding.'),
+        ('Minimum rows',        '30 rows per SKU. SKUs below this are skipped automatically.'),
+        ('Recommended history', '52+ weeks (1 year) minimum. 2+ years is ideal.'),
+        ('Duplicates',          'Duplicate Date + SKU rows are summed automatically.'),
+        ('Zero demand',         'Allowed — handled by Croston and TSB models.'),
+        ('Negative quantity',   'Rows with negative quantity are dropped.'),
+        ('Max file size',       '200 MB per upload.'),
+    ]
+    for label, detail in reqs:
+        p2 = doc.add_paragraph(style='List Bullet')
+        r4 = p2.add_run(f'{label}: '); r4.bold = True
+        p2.add_run(detail)
+
+    doc.add_paragraph()
+    sec('4  What you get')
+    outputs = [
+        'Forecast chart — 5 model lines, best model highlighted, confidence band shaded.',
+        'Forward planning table — 3-period quantities, quarter total, YoY %, confidence rating.',
+        'Export CSV — Date, SKU, Forecasted Qty, Lower/Upper Bound, Best Model, MAPE %, Confidence, Demand Pattern.',
+        'Model details — MAE, WAPE, RMSE for all 5 models, collapsed by default.',
+    ]
+    for o in outputs:
+        doc.add_paragraph(o, style='List Bullet')
+
+    doc.add_paragraph()
+    sec('5  Example data row')
+    tbl3 = doc.add_table(rows=2, cols=6)
+    tbl3.style = 'Table Grid'
+    for i, h in enumerate(['Date','SKU','Quantity','Category','Location','Price']):
+        c = tbl3.rows[0].cells[i]
+        c.text = h
+        c.paragraphs[0].runs[0].bold = True
+        c.paragraphs[0].runs[0].font.color.rgb = RGBColor(0xFF,0xFF,0xFF)
+        _add_shading(c, '1F3864')
+    for i, v in enumerate(['2024-01-07','SKU-001','120','Electronics','Store_A','9.99']):
+        tbl3.rows[1].cells[i].text = v
+
+    doc.add_paragraph()
+    p3 = doc.add_paragraph()
+    r5 = p3.add_run('The included forecastiq_sample.csv is formatted correctly and ready to upload directly.')
+    r5.italic = True; r5.font.color.rgb = RGBColor(0x92,0x40,0x0E)
+
+    doc.add_paragraph()
+    p4 = doc.add_paragraph()
+    r6 = p4.add_run('Built by Preet Patel  |  M.S. Engineering Management, USC Viterbi \'26  |  preetpatel-forecastiq.streamlit.app')
+    r6.font.size = Pt(9); r6.font.color.rgb = RGBColor(0x9C,0xA3,0xAF); r6.italic = True
+
+    docx_buf = _io.BytesIO(); doc.save(docx_buf); docx_bytes = docx_buf.getvalue()
+
+    # Sample CSV
     rng = np.random.default_rng(7)
     dates = pd.date_range("2023-01-02", periods=104, freq="W")
     cats = ["Electronics","Apparel","Home & Garden","Sporting Goods","Automotive"]
@@ -394,9 +537,10 @@ def _starter_kit_zip() -> bytes:
             rows.append([d.strftime("%Y-%m-%d"), sku, round(qty,0), cats[i%5], locs[i%5]])
     csv_bytes = pd.DataFrame(rows, columns=["Date","SKU","Quantity","Category","Location"]
                              ).to_csv(index=False).encode()
+
     buf = _io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("forecastiq_guide.xlsx", xlsx_bytes)
+        zf.writestr("forecastiq_guide.docx", docx_bytes)
         zf.writestr("forecastiq_sample.csv",  csv_bytes)
     return buf.getvalue()
 
@@ -654,7 +798,7 @@ with st.sidebar:
         file_name="forecastiq_starter_kit.zip",
         mime="application/zip",
         use_container_width=True,
-        help="Includes the format guide (.xlsx) and a sample dataset for reference.",
+        help="Includes a step-by-step data guide (.docx) and a ready-to-use sample dataset (.csv).",
     )
 
     st.markdown('<div style="margin-top:8px;"></div>', unsafe_allow_html=True)
