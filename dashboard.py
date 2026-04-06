@@ -22,6 +22,10 @@ import streamlit as st
 from core_engine import (
     INDUSTRY_PROFILES,
     MIN_DENSITY_RECORDS,
+    classify_abc,
+    classify_demand_pattern,
+    classify_xyz,
+    compute_demand_trend,
     data_quality_check,
     detect_granularity,
     forecast_sku,
@@ -72,23 +76,23 @@ def _log_run(skus_count: int, horizon: int, industry: str, granularity: str, sku
             pass  # never surface analytics errors to the user
     threading.Thread(target=_post, daemon=True).start()
 
-# ── Palette ───────────────────────────────────────────────────────────────────
-BG      = "#0d1117"
-BG2     = "#161b22"
-CARD    = "#1f2937"
-BORDER  = "#30363d"
-BORDER2 = "#374151"
-ACCENT  = "#2563eb"
-BLUE    = "#60a5fa"
+# ── Palette — Slate Pro ───────────────────────────────────────────────────────
+BG      = "#0D1117"
+BG2     = "#161B22"
+CARD    = "#1C2128"
+BORDER  = "#21262D"
+BORDER2 = "#30363D"
+ACCENT  = "#2F81F7"
+BLUE    = "#2F81F7"
 PINK    = "#f472b6"
-TEXT    = "#e6edf3"
-TEXT2   = "#9ca3af"
-TEXT3   = "#7d8590"
-TEXT4   = "#4b5563"
-GREEN   = "#3fb950"
-AMBER   = "#f59e0b"
-RED     = "#f87171"
-TEAL    = "#7dd3fc"
+TEXT    = "#F0F6FC"
+TEXT2   = "#8B949E"
+TEXT3   = "#8B949E"
+TEXT4   = "#484F58"
+GREEN   = "#3FB950"
+AMBER   = "#E3B341"
+RED     = "#F85149"
+TEAL    = "#79C0FF"
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -143,7 +147,7 @@ html, body, [class*="css"] {{
 
 .stButton > button {{
     background: {ACCENT} !important;
-    color: #fff !important;
+    color: #ffffff !important;
     border: none !important;
     border-radius: 8px !important;
     font-weight: 500 !important;
@@ -151,6 +155,7 @@ html, body, [class*="css"] {{
     padding: 10px 16px !important;
     width: 100% !important;
 }}
+.stButton > button p {{ color: #ffffff !important; }}
 .stButton > button:hover {{ opacity: 0.88 !important; }}
 
 .stDownloadButton > button {{
@@ -191,7 +196,7 @@ div[data-testid="stSlider"] [data-baseweb="slider"] div[role="progressbar"] {{
 }}
 div[data-testid="stSlider"] [role="slider"] {{
     background: {ACCENT} !important;
-    border: 2px solid {BLUE} !important;
+    border: 2px solid {TEAL} !important;
 }}
 div[data-testid="stSlider"] [data-testid="stThumbValue"] {{
     color: {BLUE} !important;
@@ -219,6 +224,7 @@ for key, default in [
     ("df_original", None),
     ("forecast_results", {}),
     ("last_run_key", None),
+    ("user_has_selected", False),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -661,13 +667,17 @@ def _build_chart(result: dict, active_model: Optional[str] = None) -> go.Figure:
     return fig
 
 
-def _build_export(results: dict) -> pd.DataFrame:
+def _build_export(results: dict, pareto_table: pd.DataFrame = None) -> pd.DataFrame:
     """
     Export CSV: one row per forecast period per SKU.
-    Columns: Date, SKU, Forecasted_Qty, Lower_Bound, Upper_Bound,
-             Best_Model, MAPE_pct, Confidence, Demand_Pattern
-    Quantities formatted with commas, no None values.
+    Columns: Date, SKU, ABC, XYZ, Forecasted_Qty, Lower_Bound, Upper_Bound,
+             Best_Model, WAPE_pct, Confidence
     """
+    # Build ABC lookup
+    abc_lkp = {}
+    if pareto_table is not None and "ABC" in pareto_table.columns:
+        abc_lkp = dict(zip(pareto_table["SKU"], pareto_table["ABC"]))
+
     rows = []
     col_map = {
         "Moving Average": "Moving_Average",
@@ -688,18 +698,31 @@ def _build_export(results: dict) -> pd.DataFrame:
         fc_vals = fdf[best_col].fillna(0).values.astype(float)
         lo_vals = np.maximum(fc_vals * 0.85, 0).astype(int)
         hi_vals = (fc_vals * 1.15).astype(int)
+
+        # XYZ from post-aggregation CV (correct — engine already computed it)
+        cv  = r["demand_profile"].get("cv", 0)
+        xyz = classify_xyz(cv if np.isfinite(cv) else 999)
+        abc = abc_lkp.get(sku, "")
+
         export = pd.DataFrame({
             "Date":           pd.to_datetime(fdf["Date"]).dt.strftime("%Y-%m-%d"),
             "SKU":            sku,
+            "ABC":            abc,
+            "XYZ":            xyz,
             "Forecasted_Qty": fc_vals.astype(int),
             "Lower_Bound":    lo_vals,
             "Upper_Bound":    hi_vals,
             "Best_Model":     best_method,
-            "MAPE_pct":       r["accuracy_results"][r["best_index"]]["MAPE_%"],
+            "WAPE_pct":       r["accuracy_results"][r["best_index"]]["MAPE_%"],
             "Confidence":     conf.get("label", ""),
-            "Demand_Pattern": r["demand_profile"]["pattern"],
         })
         rows.append(export)
+    if not rows:
+        return pd.DataFrame()
+    out = pd.concat(rows, ignore_index=True)
+    for col in ["Forecasted_Qty", "Lower_Bound", "Upper_Bound"]:
+        out[col] = out[col].apply(lambda x: f"{int(x):,}")
+    return out
     if not rows:
         return pd.DataFrame()
     out = pd.concat(rows, ignore_index=True)
@@ -709,9 +732,9 @@ def _build_export(results: dict) -> pd.DataFrame:
     return out
 
 
-def _forward_table(results: dict, granularity: str) -> pd.DataFrame:
+def _forward_table(results: dict, granularity: str, pareto_table: pd.DataFrame = None) -> pd.DataFrame:
     """
-    3-period forward planning table. Only shows periods that exist.
+    3-period forward planning table with ABC, XYZ, Trend columns.
     Quantities comma-formatted. No None values.
     """
     col_map = {
@@ -721,8 +744,13 @@ def _forward_table(results: dict, granularity: str) -> pd.DataFrame:
         "Croston":        "Croston",
         "TSB":            "TSB",
     }
-    rows = []
-    # Collect period labels from first non-skipped result
+
+    # ABC lookup from pareto table
+    abc_lkp = {}
+    if pareto_table is not None and "ABC" in pareto_table.columns:
+        abc_lkp = dict(zip(pareto_table["SKU"], pareto_table["ABC"]))
+
+    # Collect period labels
     period_labels = []
     for r in results.values():
         if not r.get("skipped"):
@@ -733,12 +761,11 @@ def _forward_table(results: dict, granularity: str) -> pd.DataFrame:
             else:
                 period_labels = [d.strftime("%d %b") for d in dates]
             break
-
-    # Pad to exactly 3 labels
     while len(period_labels) < 3:
         period_labels.append(f"P{len(period_labels)+1}")
     period_labels = period_labels[:3]
 
+    rows = []
     for sku, r in results.items():
         if r.get("skipped"):
             continue
@@ -748,28 +775,30 @@ def _forward_table(results: dict, granularity: str) -> pd.DataFrame:
         if best_col not in fdf.columns:
             best_col = "Best_Model"
 
-        # Only take up to 3 real forecast values
         fc_series = fdf[best_col].fillna(0).values[:3].astype(float)
         n_periods = len(fc_series)
 
-        # YoY vs same window in history
-        hist = r["historical_df"]["Quantity"].values.astype(float)
-        yr_back = max(0, len(hist) - (52 if granularity == "Weekly" else 12))
-        hist_same = hist[yr_back: yr_back + n_periods]
-        if len(hist_same) == n_periods and hist_same.sum() > 0:
-            yoy = ((fc_series.sum() - hist_same.sum()) / hist_same.sum()) * 100
-            yoy_str = f"+{yoy:.1f}%" if yoy >= 0 else f"{yoy:.1f}%"
-        else:
-            yoy_str = "n/a"
+        # Demand Trend — slope vs recent history, works on any history length
+        hist_vals = r["historical_df"]["Quantity"].values.astype(float)
+        fc_all    = fdf[best_col].fillna(0).values.astype(float)
+        trend_pct = compute_demand_trend(hist_vals, fc_all)
+        trend_str = f"+{trend_pct:.1f}%" if trend_pct >= 0 else f"{trend_pct:.1f}%"
+
+        # XYZ from CV
+        cv  = r["demand_profile"].get("cv", 0)
+        xyz = classify_xyz(cv if np.isfinite(cv) else 999)
+        abc = abc_lkp.get(sku, "")
 
         row = {
             "SKU":            sku,
+            "ABC":            abc,
+            "XYZ":            xyz,
             "Pattern":        r["demand_profile"]["pattern"],
             period_labels[0]: f"{int(fc_series[0]):,}" if n_periods > 0 else "—",
             period_labels[1]: f"{int(fc_series[1]):,}" if n_periods > 1 else "—",
             period_labels[2]: f"{int(fc_series[2]):,}" if n_periods > 2 else "—",
             "3-period total": f"{int(fc_series.sum()):,}",
-            "YoY %":          yoy_str,
+            "Trend":          trend_str,
             "Confidence":     conf.get("label", "?"),
         }
         rows.append(row)
@@ -830,6 +859,7 @@ with st.sidebar:
     effective_gran = "Weekly" if granularity == "Daily" else granularity
     effective_unit = horizon_unit_label(effective_gran)
     pareto_table, all_skus = pareto_analysis(df, top_n=quality["unique_skus"], silent=True)
+    pareto_table = classify_abc(pareto_table)
 
     # ── Data quality cards ────────────────────────────────────────
     st.markdown('<hr style="margin:8px 0;"/>', unsafe_allow_html=True)
@@ -856,24 +886,22 @@ with st.sidebar:
     </div>
     """, unsafe_allow_html=True)
 
-    industry_profile_preview = get_industry_profile(
-        list(INDUSTRY_PROFILES.keys())[0]
-    )
     industry = st.selectbox(
         "Industry",
         list(INDUSTRY_PROFILES.keys()),
         index=0,
         help=(
-            "Sets the seasonality model used by Holt-Winters and Trend+Seasonal.\n\n"
-            "• Retail / Semi → Multiplicative seasonality: demand swings scale with volume (bigger peaks in high months).\n"
-            "• General / Healthcare / Auto → Additive seasonality: swings stay constant regardless of volume level.\n\n"
-            "Also acts as a tiebreaker when two models score equally — each industry has a preferred model. "
-            "You'll see the active setting reflected in the chart legend and MAPE line."
+            "Sets the seasonality type and preferred model.\n\n"
+            "ADDITIVE — General, Healthcare, Auto\n"
+            "Seasonal swings stay the same size regardless of volume.\n"
+            "Best when demand is steady with regular ups and downs.\n\n"
+            "MULTIPLICATIVE — Retail, Semi\n"
+            "Seasonal swings scale with volume level.\n"
+            "Best when demand spikes are proportional to the base.\n\n"
+            "Also acts as a tiebreaker when two models score equally."
         ),
         label_visibility="visible",
     )
-    ip = get_industry_profile(industry)
-    st.caption(f"Seasonality: {ip['seasonality_type']} · Preferred: {ip['preferred_model']}")
 
     has_category = "Category" in df.columns
     has_location = "Location" in df.columns
@@ -887,6 +915,8 @@ with st.sidebar:
         if sel_cat != "All categories":
             selected_category = sel_cat
             df_filtered = df_filtered[df_filtered["Category"] == sel_cat].copy()
+    else:
+        sel_cat = "All categories"
 
     if has_location:
         locs = ["All locations"] + sorted(df["Location"].dropna().unique().tolist())
@@ -894,9 +924,12 @@ with st.sidebar:
         if sel_loc != "All locations":
             selected_location = sel_loc
             df_filtered = df_filtered[df_filtered["Location"] == sel_loc].copy()
+    else:
+        sel_loc = "All locations"
 
     # Recompute pareto after filter
     pareto_table, all_skus = pareto_analysis(df_filtered, top_n=df_filtered["SKU"].nunique(), silent=True)
+    pareto_table = classify_abc(pareto_table)
 
     st.markdown('<hr style="margin:8px 0;"/>', unsafe_allow_html=True)
 
@@ -905,33 +938,36 @@ with st.sidebar:
 
     sku_mode = st.radio(
         "SKU selection method",
-        ["Manual pick", "Pareto top N"],
-        index=0,
-        horizontal=True,
+        ["Pareto top N", "Manual pick"],
+        index=0, horizontal=True,
         label_visibility="collapsed",
     )
 
-    if sku_mode == "Manual pick":
+    if sku_mode == "Pareto top N":
+        pareto_mode = pareto_table["Pareto_Mode"].iloc[0] if len(pareto_table) else "volume"
+        pareto_n = st.slider(
+            f"Top N SKUs by {pareto_mode.lower()}",
+            min_value=1, max_value=min(20, len(all_skus)),
+            value=min(5, len(all_skus)), step=1,
+        )
+        selected_skus = all_skus[:pareto_n]
+        st.caption(f"Top {pareto_n} SKUs by {pareto_mode.lower()}.")
+    else:
         select_all = st.checkbox("Select all", value=False, key="select_all_skus")
-        default_skus = all_skus if select_all else all_skus[:min(3, len(all_skus))]
+        default_skus = all_skus if select_all else []
         selected_skus = st.multiselect(
             "SKUs to forecast",
             options=all_skus,
             default=default_skus,
             label_visibility="collapsed",
+            placeholder="Select one or more SKUs…",
         )
-    else:
-        pareto_mode = pareto_table["Pareto_Mode"].iloc[0] if len(pareto_table) else "volume"
-        pareto_n = st.slider(
-            f"Top N SKUs by {pareto_mode.lower()}",
-            min_value=1, max_value=min(20, len(all_skus)),
-            value=min(3, len(all_skus)), step=1,
-        )
-        selected_skus = all_skus[:pareto_n]
-        st.caption(f"Auto-selected top {pareto_n} SKUs by Pareto.")
+
+    # Track whether user has made any active selection
+    if selected_skus or sku_mode == "Pareto top N":
+        st.session_state.user_has_selected = True
 
     st.markdown('<hr style="margin:8px 0;"/>', unsafe_allow_html=True)
-
     # ── Step 4: Horizon ───────────────────────────────────────────
     st.markdown(f'<p style="font-size:10px;color:{TEXT3};text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px;">④ Horizon</p>', unsafe_allow_html=True)
     _max_h    = max_forecast_horizon(df_filtered, effective_gran)
@@ -982,7 +1018,19 @@ if df is None or df.empty:
     st.stop()
 
 if not selected_skus:
-    st.warning("Select at least one SKU in the sidebar, then click Run forecast.")
+    if not st.session_state.user_has_selected:
+        st.markdown(f"""
+        <div style="padding:48px 24px;text-align:center;color:{TEXT3};font-size:13px;line-height:1.8;">
+            <div style="font-size:15px;color:{TEXT2};font-weight:500;margin-bottom:8px;">
+                Ready to forecast
+            </div>
+            Use <strong style="color:{TEXT};">Pareto top N</strong> to auto-select your highest-value SKUs,
+            or switch to <strong style="color:{TEXT};">Manual pick</strong> to choose specific ones.<br>
+            Then click <strong style="color:{TEXT};">Run forecast</strong>.
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        st.info("Select at least one SKU in the sidebar, then click Run forecast.")
     st.stop()
 
 # ── Run engine only when inputs change ───────────────────────────────────────
@@ -1043,15 +1091,19 @@ all_fc_vals = np.concatenate([
 ])
 avg_monthly_demand = round(float(np.mean(all_fc_vals)), 1)
 
-# YoY: compare avg forecast vs avg of same-length history window
-avg_hist = float(np.mean(all_hist_vals[-len(all_fc_vals):]))
-yoy_pct  = ((avg_monthly_demand - avg_hist) / max(avg_hist, 1)) * 100
+# Demand Trend — computed per SKU then averaged to avoid window size inflation
+trend_pcts = []
+for r in forecasted.values():
+    hist_vals = r["historical_df"]["Quantity"].values.astype(float)
+    fc_vals   = r["forecast_df"]["Best_Model"].values.astype(float)
+    trend_pcts.append(compute_demand_trend(hist_vals, fc_vals))
+trend_pct   = round(float(np.mean(trend_pcts)), 1) if trend_pcts else 0.0
+trend_label = f"{trend_pct:+.1f}%"
 
-kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+kpi1, kpi2, kpi3 = st.columns(3)
 kpi1.metric("Forecast period",     f"{forecast_start} – {forecast_end}")
 kpi2.metric("Avg forecast demand", f"{avg_monthly_demand:.0f} units")
-kpi3.metric("YoY trend",           f"{yoy_pct:+.1f}%")
-kpi4.metric("SKUs forecasted",     f"{len(forecasted)} of {quality['unique_skus']}")
+kpi3.metric("Demand trend",        trend_label)
 
 st.markdown('<div style="margin-bottom:4px;"></div>', unsafe_allow_html=True)
 
@@ -1086,10 +1138,8 @@ with chart_col:
                 key="model_selector",
             )
 
-        # Star explanation — brief, single line
-        st.caption("★ = lowest MAPE across 4-fold cross-validation")
-
         # Warn only if user picks a worse model
+        st.caption("★ = recommended model")
         if active_model != best_method:
             best_mape  = focus["accuracy_results"][focus["best_index"]]["MAPE_%"]
             active_row = next((r for r in focus["accuracy_results"] if r["Method"] == active_model), None)
@@ -1100,7 +1150,7 @@ with chart_col:
         st.plotly_chart(_build_chart(focus, active_model), use_container_width=True)
 
         # Export button — inline after chart
-        export_df = _build_export(forecasted)
+        export_df = _build_export(forecasted, pareto_table)
         if not export_df.empty:
             buf = io.StringIO()
             export_df.to_csv(buf, index=False)
@@ -1114,28 +1164,34 @@ with chart_col:
 st.markdown('<div style="margin-bottom:4px;"></div>', unsafe_allow_html=True)
 
 # ── Forward planning table ────────────────────────────────────────────────────
-fwd_df = _forward_table(forecasted, effective_gran)
+fwd_df = _forward_table(forecasted, effective_gran, pareto_table)
 
 if not fwd_df.empty:
     st.markdown(f"""
     <div style="background:{BG2};border-radius:10px;padding:1px 0 0;">
     """, unsafe_allow_html=True)
 
-    st.dataframe(
-        fwd_df,
-        use_container_width=True,
-        hide_index=True,
-    )
+    # Sort by 3-period total descending, show top 10 by default
+    try:
+        fwd_sorted = fwd_df.copy()
+        fwd_sorted["_sort"] = fwd_sorted["3-period total"].str.replace(",","").astype(float)
+        fwd_sorted = fwd_sorted.sort_values("_sort", ascending=False).drop(columns=["_sort"])
+    except Exception:
+        fwd_sorted = fwd_df
+
+    show_all = st.checkbox(f"Show all {len(fwd_sorted)} SKUs", value=False, key="show_all_fwd")
+    display_df = fwd_sorted if show_all else fwd_sorted.head(10)
+
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
 
     # ── Model details (collapsed) ─────────────────────────────────
-    with st.expander("▾ Model details — MAPE / MAE / RMSE for all models"):
+    with st.expander("▾ Model details — WAPE / RMSE / Folds"):
         focus_for_detail = forecasted[focus_sku]
         acc_df = pd.DataFrame(focus_for_detail["accuracy_results"])
-        acc_df = acc_df[["Method", "MAE", "MAPE_%", "RMSE", "Folds"]].rename(columns={"MAPE_%": "WAPE_%"})
-        acc_df["Recommended"] = acc_df["Method"].apply(
-            lambda m: "★" if m == focus_for_detail["best_method"] else ""
-        )
-        acc_df = acc_df.sort_values("WAPE_%")
+        acc_df = acc_df[["Method", "MAPE_%", "RMSE", "Folds"]].rename(columns={"MAPE_%": "WAPE %"})
+        best_m = focus_for_detail["best_method"]
+        acc_df["Method"] = acc_df["Method"].apply(lambda m: f"{m} ★" if m == best_m else m)
+        acc_df = acc_df.sort_values("WAPE %")
         st.dataframe(acc_df, use_container_width=True, hide_index=True)
 
     st.markdown("</div>", unsafe_allow_html=True)
@@ -1143,6 +1199,6 @@ if not fwd_df.empty:
 # ── Footer ────────────────────────────────────────────────────────────────────
 st.markdown(f"""
 <div style="text-align:center;padding:1.5rem 0 0.5rem;color:{TEXT4};font-size:0.75rem;">
-    Built by Preet Patel · ForecastIQ v1.0
+    Built by Preet Patel · ForecastIQ v2.0
 </div>
 """, unsafe_allow_html=True)
