@@ -458,6 +458,79 @@ def get_industry_profile(industry: str) -> Dict[str, str]:
     return INDUSTRY_PROFILES.get(industry, INDUSTRY_PROFILES["General"])
 
 
+def classify_xyz(cv: float) -> str:
+    """Classify a SKU as X, Y, or Z based on coefficient of variation.
+    X = stable (CV <= 0.4), Y = variable (0.4 < CV <= 0.8), Z = erratic (CV > 0.8).
+    """
+    if not np.isfinite(cv):
+        return "Z"
+    if cv <= 0.4:
+        return "X"
+    if cv <= 0.8:
+        return "Y"
+    return "Z"
+
+
+def classify_abc(pareto_table: pd.DataFrame) -> pd.DataFrame:
+    """Add ABC column to pareto_table based on cumulative volume share.
+    A = top 80%, B = next 15%, C = bottom 5%.
+    """
+    out = pareto_table.copy()
+    def _abc(cum_pct: float) -> str:
+        if cum_pct <= 80:
+            return "A"
+        if cum_pct <= 95:
+            return "B"
+        return "C"
+    out["ABC"] = out["Cumulative_%"].apply(_abc)
+    return out
+
+
+def detect_structural_break(series: Iterable[float], lookback: int = 6) -> Dict[str, object]:
+    """Simple mean-shift check: compare last `lookback` periods vs prior history.
+    Returns detected=True if the ratio of means shifts by more than 25%.
+    """
+    s = pd.Series(series).dropna().astype(float)
+    if len(s) < lookback * 2:
+        return {"detected": False, "recent_mean": None, "prior_mean": None, "shift_pct": None, "lookback": lookback}
+
+    recent = s.iloc[-lookback:]
+    prior  = s.iloc[:-lookback]
+    recent_mean = float(recent.mean())
+    prior_mean  = float(prior.mean())
+
+    if prior_mean == 0:
+        return {"detected": False, "recent_mean": recent_mean, "prior_mean": prior_mean, "shift_pct": None, "lookback": lookback}
+
+    shift_pct = ((recent_mean - prior_mean) / prior_mean) * 100
+    detected  = abs(shift_pct) >= 25.0
+
+    return {
+        "detected":     detected,
+        "recent_mean":  round(recent_mean, 2),
+        "prior_mean":   round(prior_mean, 2),
+        "shift_pct":    round(shift_pct, 1),
+        "lookback":     lookback,
+    }
+
+
+def compute_demand_trend(historical_vals: Iterable[float], forecast_vals: Iterable[float]) -> float:
+    """Compute demand trend as % change from mean of recent history to mean of forecast.
+    Uses the same window length as the forecast for a fair comparison.
+    Works on any history length >= 1.
+    """
+    h = pd.Series(historical_vals).dropna().astype(float)
+    f = pd.Series(forecast_vals).dropna().astype(float)
+    if len(h) == 0 or len(f) == 0:
+        return 0.0
+    window     = min(len(f), len(h))
+    recent_avg = float(h.iloc[-window:].mean())
+    fc_avg     = float(f.mean())
+    if recent_avg == 0:
+        return 0.0
+    return round(((fc_avg - recent_avg) / recent_avg) * 100, 1)
+
+
 # -----------------------------------------------------------------------------
 # FORECASTING HELPERS
 # -----------------------------------------------------------------------------
